@@ -7107,6 +7107,8 @@ static int ndb_writer_init(struct ndb_writer *writer, struct ndb_lmdb *lmdb,
 	if (THREAD_CREATE(writer->thread_id, ndb_writer_thread, writer))
 	{
 		fprintf(stderr, "ndb writer thread failed to create\n");
+		prot_queue_destroy(&writer->inbox);
+		free(writer->queue_buf);
 		return 0;
 	}
 
@@ -7179,83 +7181,83 @@ static int ndb_ingester_destroy(struct ndb_ingester *ingester)
 static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t mapsize)
 {
 	int rc;
-	MDB_txn *txn;
+	MDB_txn *txn = NULL;
 
 	if ((rc = mdb_env_create(&lmdb->env))) {
 		fprintf(stderr, "mdb_env_create failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	if ((rc = mdb_env_set_mapsize(lmdb->env, mapsize))) {
 		fprintf(stderr, "mdb_env_set_mapsize failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	if ((rc = mdb_env_set_maxdbs(lmdb->env, NDB_DBS))) {
 		fprintf(stderr, "mdb_env_set_maxdbs failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	if ((rc = mdb_env_open(lmdb->env, filename, 0, 0664))) {
 		fprintf(stderr, "mdb_env_open failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// Initialize DBs
 	if ((rc = mdb_txn_begin(lmdb->env, NULL, 0, &txn))) {
 		fprintf(stderr, "mdb_txn_begin failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// note flatbuffer db
 	if ((rc = mdb_dbi_open(txn, "note", MDB_CREATE | MDB_INTEGERKEY, &lmdb->dbs[NDB_DB_NOTE]))) {
 		fprintf(stderr, "mdb_dbi_open event failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// note metadata db
 	if ((rc = mdb_dbi_open(txn, "meta", MDB_CREATE, &lmdb->dbs[NDB_DB_META]))) {
 		fprintf(stderr, "mdb_dbi_open meta failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// profile flatbuffer db
 	if ((rc = mdb_dbi_open(txn, "profile", MDB_CREATE | MDB_INTEGERKEY, &lmdb->dbs[NDB_DB_PROFILE]))) {
 		fprintf(stderr, "mdb_dbi_open profile failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// profile search db
 	if ((rc = mdb_dbi_open(txn, "profile_search", MDB_CREATE, &lmdb->dbs[NDB_DB_PROFILE_SEARCH]))) {
 		fprintf(stderr, "mdb_dbi_open profile_search failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_PROFILE_SEARCH], ndb_search_key_cmp);
 
 	// ndb metadata (db version, etc)
 	if ((rc = mdb_dbi_open(txn, "ndb_meta", MDB_CREATE | MDB_INTEGERKEY, &lmdb->dbs[NDB_DB_NDB_META]))) {
 		fprintf(stderr, "mdb_dbi_open ndb_meta failed, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// profile last fetches
 	if ((rc = mdb_dbi_open(txn, "profile_last_fetch", MDB_CREATE, &lmdb->dbs[NDB_DB_PROFILE_LAST_FETCH]))) {
 		fprintf(stderr, "mdb_dbi_open profile last fetch, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// relay kind index. maps <relay_url><kind><created><note_id> primary keys to relay records
 	// see ndb_relay_kind_cmp function for more details on the key format
 	if ((rc = mdb_dbi_open(txn, "relay_kind", MDB_CREATE, &lmdb->dbs[NDB_DB_NOTE_RELAY_KIND]))) {
 		fprintf(stderr, "mdb_dbi_open profile last fetch, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_RELAY_KIND], ndb_relay_kind_cmp);
 
 	// note_id -> relay index
 	if ((rc = mdb_dbi_open(txn, "note_relays", MDB_CREATE | MDB_DUPSORT, &lmdb->dbs[NDB_DB_NOTE_RELAYS]))) {
 		fprintf(stderr, "mdb_dbi_open profile last fetch, error %d\n", rc);
-		return 0;
+		goto fail;
 	}
 
 	// id+ts index flags
@@ -7264,13 +7266,13 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 	// index dbs
 	if ((rc = mdb_dbi_open(txn, "note_id", tsid_flags, &lmdb->dbs[NDB_DB_NOTE_ID]))) {
 		fprintf(stderr, "mdb_dbi_open id failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_ID], ndb_tsid_compare);
 
 	if ((rc = mdb_dbi_open(txn, "profile_pk", tsid_flags, &lmdb->dbs[NDB_DB_PROFILE_PK]))) {
 		fprintf(stderr, "mdb_dbi_open profile_pk failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_PROFILE_PK], ndb_tsid_compare);
 
@@ -7278,7 +7280,7 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 			       MDB_CREATE | MDB_DUPSORT | MDB_INTEGERDUP | MDB_DUPFIXED,
 			       &lmdb->dbs[NDB_DB_NOTE_KIND]))) {
 		fprintf(stderr, "mdb_dbi_open note_kind failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_KIND], ndb_u64_ts_compare);
 
@@ -7286,7 +7288,7 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 			       MDB_CREATE | MDB_DUPSORT | MDB_INTEGERDUP | MDB_DUPFIXED,
 			       &lmdb->dbs[NDB_DB_NOTE_PUBKEY]))) {
 		fprintf(stderr, "mdb_dbi_open note_pubkey failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_PUBKEY], ndb_tsid_compare);
 
@@ -7294,37 +7296,47 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 			       MDB_CREATE | MDB_DUPSORT | MDB_INTEGERDUP | MDB_DUPFIXED,
 			       &lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND]))) {
 		fprintf(stderr, "mdb_dbi_open note_pubkey_kind failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], ndb_id_u64_ts_compare);
 
 	if ((rc = mdb_dbi_open(txn, "note_text", MDB_CREATE | MDB_DUPSORT,
 			       &lmdb->dbs[NDB_DB_NOTE_TEXT]))) {
 		fprintf(stderr, "mdb_dbi_open note_text failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_TEXT], ndb_text_search_key_compare);
 
 	if ((rc = mdb_dbi_open(txn, "note_blocks", MDB_CREATE | MDB_INTEGERKEY,
 			       &lmdb->dbs[NDB_DB_NOTE_BLOCKS]))) {
 		fprintf(stderr, "mdb_dbi_open note_blocks failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 
 	if ((rc = mdb_dbi_open(txn, "note_tags", MDB_CREATE | MDB_DUPSORT | MDB_DUPFIXED,
 			       &lmdb->dbs[NDB_DB_NOTE_TAGS]))) {
 		fprintf(stderr, "mdb_dbi_open note_tags failed: %s\n", mdb_strerror(rc));
-		return 0;
+		goto fail;
 	}
 	mdb_set_compare(txn, lmdb->dbs[NDB_DB_NOTE_TAGS], ndb_tag_key_compare);
 
 	// Commit the transaction
 	if ((rc = mdb_txn_commit(txn))) {
 		fprintf(stderr, "mdb_txn_commit failed, error %d\n", rc);
-		return 0;
+		txn = NULL;
+		goto fail;
 	}
 
 	return 1;
+
+fail:
+	if (txn != NULL)
+		mdb_txn_abort(txn);
+	if (lmdb->env != NULL) {
+		mdb_env_close(lmdb->env);
+		lmdb->env = NULL;
+	}
+	return 0;
 }
 
 static int ndb_queue_write_version(struct ndb *ndb, uint64_t version)
@@ -7385,30 +7397,34 @@ int ndb_init(struct ndb **pndb, const char *filename, const struct ndb_config *c
 	struct ndb *ndb;
 	//MDB_dbi ind_id; // TODO: ind_pk, etc
 
-	ndb = *pndb = calloc(1, sizeof(struct ndb));
-	ndb->flags = config->flags;
+	ndb = calloc(1, sizeof(struct ndb));
 
 	if (ndb == NULL) {
 		fprintf(stderr, "ndb_init: malloc failed\n");
 		return 0;
 	}
 
-	if (!ndb_init_lmdb(filename, &ndb->lmdb, config->mapsize))
+	ndb->flags = config->flags;
+
+	if (!ndb_init_lmdb(filename, &ndb->lmdb, config->mapsize)) {
+		free(ndb);
 		return 0;
+	}
 
 	ndb_monitor_init(&ndb->monitor, config->sub_cb, config->sub_cb_ctx);
 
 	if (!ndb_writer_init(&ndb->writer, &ndb->lmdb, &ndb->monitor, ndb->flags,
 			     config->writer_scratch_buffer_size)) {
 		fprintf(stderr, "ndb_writer_init failed\n");
-		return 0;
+		goto fail;
 	}
 
 	if (!ndb_ingester_init(&ndb->ingester, &ndb->lmdb, &ndb->writer.inbox,
 			       config->writer_scratch_buffer_size, config)) {
 		fprintf(stderr, "failed to initialize %d ingester thread(s)\n",
 				config->ingester_threads);
-		return 0;
+		ndb_writer_destroy(&ndb->writer);
+		goto fail;
 	}
 
 	if (!ndb_flag_set(config->flags, NDB_FLAG_NOMIGRATE)) {
@@ -7417,7 +7433,14 @@ int ndb_init(struct ndb **pndb, const char *filename, const struct ndb_config *c
 	}
 
 	// Initialize LMDB environment and spin up threads
+	*pndb = ndb;
 	return 1;
+
+fail:
+	ndb_monitor_destroy(&ndb->monitor);
+	mdb_env_close(ndb->lmdb.env);
+	free(ndb);
+	return 0;
 }
 
 void ndb_destroy(struct ndb *ndb)
